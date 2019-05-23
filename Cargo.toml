@@ -1,12 +1,20 @@
 [package]
 name = "lazy_async_pool"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 edition = "2018"
 description = "An asyncronous object pool that generates objects on the fly."
 license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+timeout = []
+
 [dependencies]
 futures = "0.1"
 qutex = "0.2"
+
+[dev-dependencies]
+tokio-postgres = "0.4.0-rc.2"
+tokio = "*"
+failure = "*"
