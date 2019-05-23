@@ -11,7 +11,7 @@ Add this to your `Cargo.toml`:
 lazy_async_pool = "0.1.1"
 ```
 
-### Example: Connecting to bitcoin rpc server
+### Example: DB Connection Pool
 
 ```rust
 use lazy_async_pool::Pool;
