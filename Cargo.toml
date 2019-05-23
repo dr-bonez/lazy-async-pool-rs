@@ -1,11 +1,12 @@
 [package]
 name = "lazy_async_pool"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 edition = "2018"
 description = "An asyncronous object pool that generates objects on the fly."
 license = "MIT"
 repository = "https://github.com/DR-BoneZ/lazy-async-pool-rs"
+documentation = "http://docs.rs/lazy_async_pool"
 
 [features]
 timeout = []

@@ -19,7 +19,7 @@ use lazy_async_pool::Pool;
 fn main() {
     let pool = Pool::new(20, || {
         tokio_postgres::connect(
-            "postgres://amcclelland:pass@localhost:5432/pgdb",
+            "postgres://drbonez:pass@localhost:5432/pgdb",
             tokio_postgres::NoTls,
         )
         .map(|(client, connection)| {
@@ -47,7 +47,10 @@ fn main() {
                 .map_err(Error::from)
                 .map(|rows| (client, rows))
         })
-        .and_then(|(client, rows)| client.release().map(move |_| rows).map_err(Error::from))
+        .and_then(
+            |(client, rows)| client.release().map(move |_| rows).map_err(Error::from), // required to return the resource to the pool.
+                                                                                       // this cannot be checked at compile time until we have something like https://github.com/rust-lang/rfcs/pull/1180
+        )
         .map(|rows| {
             let hello: String = rows[0].get(0);
             assert_eq!("hello", &hello)
