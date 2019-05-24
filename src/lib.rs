@@ -1,3 +1,4 @@
+use crossbeam_channel::bounded;
 use crossbeam_channel::unbounded;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
@@ -22,6 +23,7 @@ struct PoolInternal<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError
     cap: usize,
 }
 
+/// Lazy Asyncronous Object Pool
 pub struct Pool<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError>(
     Arc<PoolInternal<T, F, U, E>>,
 );
@@ -41,8 +43,14 @@ where
     U: Future<Item = T, Error = E>,
     E: StdError,
 {
+    /// Generates a new pool.
+    ///
+    /// # Arguments
+    /// * `cap` - Maximum number of objects to generate.
+    ///   * Use `0` to make it unbounded.
+    ///   * The `timeout` feature can cause it to go past this limit, but extra resources will be dropped when released.
     pub fn new(cap: usize, gen: F) -> Self {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = if cap > 0 { bounded(cap) } else { unbounded() };
         Pool(Arc::new(PoolInternal {
             sender,
             receiver,
@@ -52,6 +60,10 @@ where
         }))
     }
 
+    /// Obtain an item from the pool.
+    /// If the pool is exhausted and not at capacity, generates a new item.
+    /// If the pool is exhausted and at capacity, wait for a new item to be available.
+    /// * If the timeout is reached before an item becomes available, generates a new one.
     #[cfg(feature = "timeout")]
     pub fn get(self, timeout: Duration) -> impl Future<Item = PoolGuard<T, F, U, E>, Error = E> {
         match self.0.receiver.try_recv() {
@@ -60,20 +72,30 @@ where
                 item: Some(t),
             }))),
             Err(_) => {
-                let out = self.0.out.load(Ordering::SeqCst);
-                if out < self.0.cap {
-                    self.0.out.fetch_add(1, Ordering::SeqCst);
-                    Either::A(Either::B((self.0.gen)().map(move |t| PoolGuard {
-                        pool: self.clone(),
+                let closure = |pool| {
+                    move |t| PoolGuard {
+                        pool,
                         item: Some(t),
-                    })))
+                    }
+                };
+                if self.0.cap > 0 {
+                    let out = self.0.out.load(Ordering::SeqCst);
+                    if out < self.0.cap {
+                        self.0.out.fetch_add(1, Ordering::SeqCst);
+                        Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                    } else {
+                        Either::B(PoolFuture::new(self.clone(), timeout))
+                    }
                 } else {
-                    Either::B(PoolFuture::new(self.clone(), timeout))
+                    Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
                 }
             }
         }
     }
 
+    /// Obtain an item from the pool.
+    /// If the pool is exhausted and not at capacity, generates a new item.
+    /// If the pool is exhausted and at capacity, wait for a new item to be available.
     #[cfg(not(feature = "timeout"))]
     pub fn get(self) -> impl Future<Item = PoolGuard<T, F, U, E>, Error = E> {
         match self.0.receiver.try_recv() {
@@ -82,24 +104,34 @@ where
                 item: Some(t),
             }))),
             Err(_) => {
-                let out = self.0.out.load(Ordering::SeqCst);
-                if out < self.0.cap {
-                    self.0.out.fetch_add(1, Ordering::SeqCst);
-                    Either::A(Either::B((self.0.gen)().map(move |t| PoolGuard {
-                        pool: self.clone(),
+                let closure = |pool| {
+                    move |t| PoolGuard {
+                        pool,
                         item: Some(t),
-                    })))
+                    }
+                };
+                if self.0.cap > 0 {
+                    let out = self.0.out.load(Ordering::SeqCst);
+                    if out < self.0.cap {
+                        self.0.out.fetch_add(1, Ordering::SeqCst);
+                        Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                    } else {
+                        Either::B(PoolFuture::new(self.clone()))
+                    }
                 } else {
-                    Either::B(PoolFuture::new(self.clone()))
+                    Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
                 }
             }
         }
     }
 
+    /// Number of items available in the pool.
     pub fn len(&self) -> usize {
         self.0.receiver.len()
     }
 
+    /// Manually add a new item to the pool.
+    /// * Does not count towards the cap.
     pub fn add(&self, item: T) -> Result<(), crossbeam_channel::SendError<T>> {
         self.0.sender.send(item)
     }
@@ -180,6 +212,8 @@ where
     }
 }
 
+/// Guard around an item checked out from the pool.
+/// Will return the item to the pool when dropped.
 pub struct PoolGuard<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError> {
     pool: Pool<T, F, U, E>,
     item: Option<T>,
@@ -190,11 +224,19 @@ where
     U: Future<Item = T, Error = E>,
     E: StdError,
 {
-    pub fn destroy(mut self) {
+    /// Detaches the item from the pool so it is not returned.
+    /// If the pool is bounded, will allow the pool to generate a new object to replace it.
+    pub fn detach(mut self) -> T {
         let item = self.item.take();
-        if item.is_some() {
+        if self.pool.0.cap > 0 {
             self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
         }
+        item.unwrap()
+    }
+
+    /// Destroys the item instead of returning it to the pool.
+    pub fn destroy(self) {
+        self.detach();
     }
 }
 
@@ -229,7 +271,7 @@ where
     fn drop(&mut self) {
         #[cfg(feature = "timeout")]
         {
-            if self.pool.0.out.load(Ordering::SeqCst) > self.pool.0.cap {
+            if self.pool.0.cap > 0 && self.pool.0.out.load(Ordering::SeqCst) > self.pool.0.cap {
                 self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
@@ -239,7 +281,9 @@ where
             match self.pool.add(item) {
                 Ok(_) => (),
                 Err(_) => {
-                    self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
+                    if self.pool.0.cap > 0 {
+                        self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
+                    }
                 }
             };
         }

@@ -8,8 +8,12 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lazy_async_pool = "0.1.1"
+lazy_async_pool = "0.2.1"
 ```
+
+## Features
+
+`timeout`: set a timeout duration after which a new object will be generated even if the pool has no free resources and is at capacity.
 
 ### Example: DB Connection Pool
 
