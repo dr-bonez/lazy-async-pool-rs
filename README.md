@@ -10,7 +10,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-lazy_async_pool = "0.2.1"
+lazy_async_pool = "0.3.0"
 ```
 
 ## Features
