@@ -1,21 +1,22 @@
-use crossbeam_channel::bounded;
-use crossbeam_channel::unbounded;
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
-use futures::future::{ok, Either};
-use futures::Async;
-use futures::Future;
-use futures::Poll;
-use std::error::Error as StdError;
+use std::future::Future;
+use std::marker::Unpin;
+use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 #[cfg(feature = "timeout")]
 use std::time::Duration;
 #[cfg(feature = "timeout")]
 use std::time::Instant;
 
-struct PoolInternal<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError> {
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+
+struct PoolInternal<T, F: Fn() -> U, U: Future<Output = Result<T, E>>, E> {
     sender: Sender<T>,
     receiver: Receiver<T>,
     out: AtomicUsize,
@@ -24,14 +25,13 @@ struct PoolInternal<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError
 }
 
 /// Lazy Asyncronous Object Pool
-pub struct Pool<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError>(
+pub struct Pool<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E>(
     Arc<PoolInternal<T, F, U, E>>,
 );
 impl<T, F, U, E> Clone for Pool<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     fn clone(&self) -> Self {
         Pool(self.0.clone())
@@ -40,8 +40,7 @@ where
 impl<T, F, U, E> Pool<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     /// Generates a new pool.
     ///
@@ -65,12 +64,12 @@ where
     /// If the pool is exhausted and at capacity, wait for a new item to be available.
     /// * If the timeout is reached before an item becomes available, generates a new one.
     #[cfg(feature = "timeout")]
-    pub fn get(self, timeout: Duration) -> impl Future<Item = PoolGuard<T, F, U, E>, Error = E> {
+    pub async fn get(self, timeout: Duration) -> Result<PoolGuard<T, F, U, E>, E> {
         match self.0.receiver.try_recv() {
-            Ok(t) => Either::A(Either::A(ok(PoolGuard {
+            Ok(t) => Ok(PoolGuard {
                 pool: self.clone(),
                 item: Some(t),
-            }))),
+            }),
             Err(_) => {
                 let closure = |pool| {
                     move |t| PoolGuard {
@@ -82,12 +81,12 @@ where
                     let out = self.0.out.load(Ordering::SeqCst);
                     if out < self.0.cap {
                         self.0.out.fetch_add(1, Ordering::SeqCst);
-                        Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                        (self.0.gen)().await.map(closure(self.clone()))
                     } else {
-                        Either::B(PoolFuture::new(self.clone(), timeout))
+                        PoolFuture::new(self.clone(), timeout).await
                     }
                 } else {
-                    Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                    (self.0.gen)().await.map(closure(self.clone()))
                 }
             }
         }
@@ -97,12 +96,12 @@ where
     /// If the pool is exhausted and not at capacity, generates a new item.
     /// If the pool is exhausted and at capacity, wait for a new item to be available.
     #[cfg(not(feature = "timeout"))]
-    pub fn get(self) -> impl Future<Item = PoolGuard<T, F, U, E>, Error = E> {
+    pub async fn get(self) -> Result<PoolGuard<T, F, U, E>, E> {
         match self.0.receiver.try_recv() {
-            Ok(t) => Either::A(Either::A(ok(PoolGuard {
+            Ok(t) => Ok(PoolGuard {
                 pool: self.clone(),
                 item: Some(t),
-            }))),
+            }),
             Err(_) => {
                 let closure = |pool| {
                     move |t| PoolGuard {
@@ -114,12 +113,12 @@ where
                     let out = self.0.out.load(Ordering::SeqCst);
                     if out < self.0.cap {
                         self.0.out.fetch_add(1, Ordering::SeqCst);
-                        Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                        (self.0.gen)().await.map(closure(self.clone()))
                     } else {
-                        Either::B(PoolFuture::new(self.clone()))
+                        PoolFuture::new(self.clone()).await
                     }
                 } else {
-                    Either::A(Either::B((self.0.gen)().map(closure(self.clone()))))
+                    (self.0.gen)().await.map(closure(self.clone()))
                 }
             }
         }
@@ -137,7 +136,7 @@ where
     }
 }
 
-struct PoolFuture<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError> {
+struct PoolFuture<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
     internal: Option<U>,
     #[cfg(feature = "timeout")]
@@ -148,8 +147,7 @@ struct PoolFuture<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError> 
 impl<'a, T, F, U, E> PoolFuture<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     #[cfg(not(feature = "timeout"))]
     fn new(pool: Pool<T, F, U, E>) -> Self {
@@ -172,16 +170,14 @@ where
 impl<T, F, U, E> Future for PoolFuture<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
-    type Item = PoolGuard<T, F, U, E>;
-    type Error = E;
+    type Output = Result<PoolGuard<T, F, U, E>, E>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match &mut self.internal {
             None => match self.pool.0.receiver.try_recv() {
-                Ok(t) => Ok(Async::Ready(PoolGuard {
+                Ok(t) => Poll::Ready(Ok(PoolGuard {
                     pool: self.pool.clone(),
                     item: Some(t),
                 })),
@@ -194,19 +190,19 @@ where
                         cond
                     } {
                         self.internal = Some((self.pool.0.gen)());
-                        Ok(Async::NotReady)
+                        Poll::Pending
                     } else {
-                        Ok(Async::NotReady)
+                        Poll::Pending
                     }
                 }
             },
-            Some(ref mut fut) => match fut.poll() {
-                Ok(Async::Ready(t)) => Ok(Async::Ready(PoolGuard {
+            Some(ref mut fut) => match Pin::new(fut).poll(cx) {
+                Poll::Ready(Ok(t)) => Poll::Ready(Ok(PoolGuard {
                     pool: self.pool.clone(),
                     item: Some(t),
                 })),
-                Ok(Async::NotReady) => Ok(Async::NotReady),
-                Err(e) => Err(e),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
             },
         }
     }
@@ -214,15 +210,14 @@ where
 
 /// Guard around an item checked out from the pool.
 /// Will return the item to the pool when dropped.
-pub struct PoolGuard<T, F: Fn() -> U, U: Future<Item = T, Error = E>, E: StdError> {
+pub struct PoolGuard<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
     item: Option<T>,
 }
 impl<T, F, U, E> PoolGuard<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     /// Detaches the item from the pool so it is not returned.
     /// If the pool is bounded, will allow the pool to generate a new object to replace it.
@@ -243,8 +238,7 @@ where
 impl<T, F, U, E> std::ops::Deref for PoolGuard<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     type Target = T;
 
@@ -255,8 +249,7 @@ where
 impl<T, F, U, E> std::ops::DerefMut for PoolGuard<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     fn deref_mut(&mut self) -> &mut T {
         self.item.as_mut().unwrap()
@@ -265,8 +258,7 @@ where
 impl<T, F, U, E> Drop for PoolGuard<T, F, U, E>
 where
     F: Fn() -> U,
-    U: Future<Item = T, Error = E>,
-    E: StdError,
+    U: Future<Output = Result<T, E>> + Unpin,
 {
     fn drop(&mut self) {
         #[cfg(feature = "timeout")]
@@ -290,47 +282,39 @@ where
     }
 }
 
-#[test]
-fn test() {
-    use failure::Error;
+#[cfg(test)]
+async fn test_fut() -> Result<(), failure::Error> {
+    use futures::FutureExt;
+    use futures::TryFutureExt;
 
     let pool = Pool::new(20, || {
         tokio_postgres::connect(
             "postgres://amcclelland:pass@localhost:5432/pgdb",
             tokio_postgres::NoTls,
         )
-        .map(|(client, connection)| {
+        .map_ok(|(client, connection)| {
             let connection = connection.map_err(|e| eprintln!("connection error: {}", e));
             tokio::spawn(connection);
             client
         })
+        .boxed()
     });
 
-    let fut = pool
-        .clone()
-        .get()
-        .map_err(Error::from)
-        .and_then(|mut client| {
-            client
-                .prepare("SELECT $1::TEXT")
-                .map(|stmt| (client, stmt))
-                .map_err(Error::from)
-        })
-        .and_then(move |(mut client, stmt)| {
-            use futures::stream::Stream;
-            client
-                .query(&stmt, &[&"hello".to_owned()])
-                .take(1)
-                .collect()
-                .map_err(Error::from)
-        })
-        .map(move |rows| {
-            let hello: String = rows[0].get(0);
-            println!("{}", hello);
-            assert_eq!("hello", &hello);
-            println!("len: {}", pool.len());
-            assert_eq!(1, pool.len());
-        });
+    let client = pool.clone().get().await?;
+    let stmt = client.prepare("SELECT $1::TEXT").await?;
+    let rows = client.query(&stmt, &[&"hello".to_owned()]).await?;
+    let hello: String = rows[0].get(0);
+    println!("{}", hello);
+    assert_eq!("hello", &hello);
+    println!("len: {}", pool.len());
+    assert_eq!(1, pool.len());
+    Ok(())
+}
 
-    tokio::run(fut.map_err(|e| eprintln!("{}", e)));
+#[test]
+fn test() {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(test_fut())
+        .unwrap();
 }
