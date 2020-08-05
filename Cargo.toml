@@ -1,6 +1,6 @@
 [package]
 name = "lazy_async_pool"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 edition = "2018"
 description = "An asyncronous object pool that generates objects on the fly."
@@ -13,10 +13,10 @@ readme = "README.md"
 timeout = []
 
 [dependencies]
-futures = "0.3.4"
-crossbeam-channel = "0.4.2"
+futures = "0.3.5"
+crossbeam-channel = "0.4.3"
 
 [dev-dependencies]
-tokio-postgres = "0.5.2"
-tokio = "0.2.13"
+tokio-postgres = "0.5.5"
+tokio = "0.2.22"
 failure = "0.1"

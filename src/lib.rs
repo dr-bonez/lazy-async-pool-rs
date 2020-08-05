@@ -101,12 +101,14 @@ where
             Ok(t) => Ok(PoolGuard {
                 pool: self.clone(),
                 item: Some(t),
+                dirty: false,
             }),
             Err(_) => {
                 let closure = |pool| {
                     move |t| PoolGuard {
                         pool,
                         item: Some(t),
+                        dirty: false,
                     }
                 };
                 if self.0.cap > 0 {
@@ -180,6 +182,7 @@ where
                 Ok(t) => Poll::Ready(Ok(PoolGuard {
                     pool: self.pool.clone(),
                     item: Some(t),
+                    dirty: false,
                 })),
                 Err(_) => {
                     if self.pool.0.out.load(Ordering::SeqCst) < self.pool.0.cap || {
@@ -200,6 +203,7 @@ where
                 Poll::Ready(Ok(t)) => Poll::Ready(Ok(PoolGuard {
                     pool: self.pool.clone(),
                     item: Some(t),
+                    dirty: false,
                 })),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,
@@ -213,12 +217,24 @@ where
 pub struct PoolGuard<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
     item: Option<T>,
+    dirty: bool,
 }
 impl<T, F, U, E> PoolGuard<T, F, U, E>
 where
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
+    /// Marks a resource as being in a dirty state.
+    /// If it is dropped while in a dirty state, it will be destroyed instead of returned to the pool.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Marks a resource as no longer being dirty.
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
     /// Detaches the item from the pool so it is not returned.
     /// If the pool is bounded, will allow the pool to generate a new object to replace it.
     pub fn detach(mut self) -> T {
@@ -261,23 +277,23 @@ where
     U: Future<Output = Result<T, E>> + Unpin,
 {
     fn drop(&mut self) {
-        #[cfg(feature = "timeout")]
+        if self.pool.0.cap > 0
+            && ((cfg!(feature = "timeout")
+                && self.pool.0.out.load(Ordering::SeqCst) > self.pool.0.cap)
+                || self.dirty)
         {
-            if self.pool.0.cap > 0 && self.pool.0.out.load(Ordering::SeqCst) > self.pool.0.cap {
-                self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
-                return;
-            }
-        }
-        let item = self.item.take();
-        if let Some(item) = item {
-            match self.pool.add(item) {
-                Ok(_) => (),
-                Err(_) => {
-                    if self.pool.0.cap > 0 {
-                        self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
+            self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            if let Some(item) = self.item.take() {
+                match self.pool.add(item) {
+                    Ok(_) => {
+                        if self.pool.0.cap > 0 {
+                            self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
+                        }
                     }
-                }
-            };
+                    Err(_) => (),
+                };
+            }
         }
     }
 }
