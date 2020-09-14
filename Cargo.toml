@@ -1,6 +1,6 @@
 [package]
 name = "lazy_async_pool"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Aiden McClelland <me@drbonez.dev>"]
 edition = "2018"
 description = "An asyncronous object pool that generates objects on the fly."
