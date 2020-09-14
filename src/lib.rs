@@ -259,7 +259,7 @@ where
     U: Future<Output = Result<T, E>> + Unpin,
 {
     fn drop(&mut self) {
-        if self.pool.0.cap > 0 || self.dirty {
+        if self.dirty {
             self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
         } else {
             if let Some(item) = self.item.take() {
@@ -282,7 +282,7 @@ async fn test_fut() -> Result<(), failure::Error> {
 
     let pool = Pool::new(20, || {
         tokio_postgres::connect(
-            "postgres://amcclelland:pass@localhost:5432/pgdb",
+            "postgres://aiden:pass@localhost:5432/pgdb",
             tokio_postgres::NoTls,
         )
         .map_ok(|(client, connection)| {
