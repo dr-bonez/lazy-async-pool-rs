@@ -23,11 +23,12 @@ struct PoolInternal<T, F: Fn() -> U, U: Future<Output = Result<T, E>>, E> {
 }
 
 /// Lazy Asyncronous Object Pool
-pub struct Pool<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E>(
+pub struct Pool<T: Send + 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E>(
     Arc<PoolInternal<T, F, U, E>>,
 );
 impl<T, F, U, E> Clone for Pool<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -37,6 +38,7 @@ where
 }
 impl<T, F, U, E> Pool<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -135,12 +137,13 @@ where
     }
 }
 
-struct PoolFuture<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
+struct PoolFuture<T: Send + 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
-    internal: Option<Either<U, Pin<Box<dyn Future<Output = Result<T, E>>>>>>,
+    internal: Option<Either<U, Pin<Box<dyn Future<Output = Result<T, E>> + Send>>>>,
 }
 impl<'a, T, F, U, E> PoolFuture<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -153,6 +156,7 @@ where
 }
 impl<T, F, U, E> Future for PoolFuture<T, F, U, E>
 where
+    T: Send + 'static,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -174,7 +178,7 @@ where
                     } else {
                         let recv = self.pool.0.receiver.clone();
                         self.internal = Some(Either::Right(
-                            async move { Ok(recv.recv().await.unwrap()) }.boxed_local(),
+                            async move { Ok(recv.recv().await.unwrap()) }.boxed(),
                         ));
                         cx.waker().clone().wake();
                         Poll::Pending
@@ -196,13 +200,14 @@ where
 
 /// Guard around an item checked out from the pool.
 /// Will return the item to the pool when dropped.
-pub struct PoolGuard<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
+pub struct PoolGuard<T: Send + 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
     item: Option<T>,
     dirty: bool,
 }
 impl<T, F, U, E> PoolGuard<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -235,6 +240,7 @@ where
 
 impl<T, F, U, E> std::ops::Deref for PoolGuard<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -246,6 +252,7 @@ where
 }
 impl<T, F, U, E> std::ops::DerefMut for PoolGuard<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -255,6 +262,7 @@ where
 }
 impl<T, F, U, E> Drop for PoolGuard<T, F, U, E>
 where
+    T: Send,
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
@@ -296,6 +304,7 @@ async fn test_fut() -> Result<(), failure::Error> {
     let client = pool.clone().get().await?;
     let stmt = client.prepare("SELECT $1::TEXT").await?;
     let rows = client.query(&stmt, &[&"hello".to_owned()]).await?;
+    drop(client);
     let hello: String = rows[0].get(0);
     println!("{}", hello);
     assert_eq!("hello", &hello);
