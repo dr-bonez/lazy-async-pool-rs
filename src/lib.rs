@@ -6,15 +6,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-#[cfg(feature = "timeout")]
-use std::time::Duration;
-#[cfg(feature = "timeout")]
-use std::time::Instant;
 
-use crossbeam_channel::bounded;
-use crossbeam_channel::unbounded;
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
+use async_channel::bounded;
+use async_channel::unbounded;
+use async_channel::Receiver;
+use async_channel::Sender;
+use futures::future::Either;
+use futures::FutureExt;
 
 struct PoolInternal<T, F: Fn() -> U, U: Future<Output = Result<T, E>>, E> {
     sender: Sender<T>,
@@ -25,7 +23,7 @@ struct PoolInternal<T, F: Fn() -> U, U: Future<Output = Result<T, E>>, E> {
 }
 
 /// Lazy Asyncronous Object Pool
-pub struct Pool<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E>(
+pub struct Pool<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E>(
     Arc<PoolInternal<T, F, U, E>>,
 );
 impl<T, F, U, E> Clone for Pool<T, F, U, E>
@@ -65,7 +63,7 @@ where
     /// * If the timeout is reached before an item becomes available, generates a new one.
     #[cfg(feature = "timeout")]
     pub async fn get(self, timeout: Duration) -> Result<PoolGuard<T, F, U, E>, E> {
-        match self.0.receiver.try_recv() {
+        match self.0.receiver.recv() {
             Ok(t) => Ok(PoolGuard {
                 pool: self.clone(),
                 item: Some(t),
@@ -95,7 +93,6 @@ where
     /// Obtain an item from the pool.
     /// If the pool is exhausted and not at capacity, generates a new item.
     /// If the pool is exhausted and at capacity, wait for a new item to be available.
-    #[cfg(not(feature = "timeout"))]
     pub async fn get(self) -> Result<PoolGuard<T, F, U, E>, E> {
         match self.0.receiver.try_recv() {
             Ok(t) => Ok(PoolGuard {
@@ -133,39 +130,24 @@ where
 
     /// Manually add a new item to the pool.
     /// * Does not count towards the cap.
-    pub fn add(&self, item: T) -> Result<(), crossbeam_channel::SendError<T>> {
-        self.0.sender.send(item)
+    pub fn add(&self, item: T) -> Result<(), async_channel::TrySendError<T>> {
+        self.0.sender.try_send(item)
     }
 }
 
-struct PoolFuture<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
+struct PoolFuture<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
-    internal: Option<U>,
-    #[cfg(feature = "timeout")]
-    timeout: Duration,
-    #[cfg(feature = "timeout")]
-    start: Instant,
+    internal: Option<Either<U, Pin<Box<dyn Future<Output = Result<T, E>>>>>>,
 }
 impl<'a, T, F, U, E> PoolFuture<T, F, U, E>
 where
     F: Fn() -> U,
     U: Future<Output = Result<T, E>> + Unpin,
 {
-    #[cfg(not(feature = "timeout"))]
     fn new(pool: Pool<T, F, U, E>) -> Self {
         PoolFuture {
             internal: None,
             pool,
-        }
-    }
-
-    #[cfg(feature = "timeout")]
-    fn new(pool: Pool<T, F, U, E>, timeout: Duration) -> Self {
-        PoolFuture {
-            internal: None,
-            pool,
-            timeout,
-            start: Instant::now(),
         }
     }
 }
@@ -185,16 +167,16 @@ where
                     dirty: false,
                 })),
                 Err(_) => {
-                    if self.pool.0.out.load(Ordering::SeqCst) < self.pool.0.cap || {
-                        #[cfg(feature = "timeout")]
-                        let cond = self.start.elapsed() > self.timeout;
-                        #[cfg(not(feature = "timeout"))]
-                        let cond = false;
-                        cond
-                    } {
-                        self.internal = Some((self.pool.0.gen)());
+                    if self.pool.0.out.load(Ordering::SeqCst) < self.pool.0.cap {
+                        self.internal = Some(Either::Left((self.pool.0.gen)()));
+                        cx.waker().clone().wake();
                         Poll::Pending
                     } else {
+                        let recv = self.pool.0.receiver.clone();
+                        self.internal = Some(Either::Right(
+                            async move { Ok(recv.recv().await.unwrap()) }.boxed_local(),
+                        ));
+                        cx.waker().clone().wake();
                         Poll::Pending
                     }
                 }
@@ -214,7 +196,7 @@ where
 
 /// Guard around an item checked out from the pool.
 /// Will return the item to the pool when dropped.
-pub struct PoolGuard<T, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
+pub struct PoolGuard<T: 'static, F: Fn() -> U, U: Future<Output = Result<T, E>> + Unpin, E> {
     pool: Pool<T, F, U, E>,
     item: Option<T>,
     dirty: bool,
@@ -277,11 +259,7 @@ where
     U: Future<Output = Result<T, E>> + Unpin,
 {
     fn drop(&mut self) {
-        if self.pool.0.cap > 0
-            && ((cfg!(feature = "timeout")
-                && self.pool.0.out.load(Ordering::SeqCst) > self.pool.0.cap)
-                || self.dirty)
-        {
+        if self.pool.0.cap > 0 || self.dirty {
             self.pool.0.out.fetch_sub(1, Ordering::SeqCst);
         } else {
             if let Some(item) = self.item.take() {
@@ -300,7 +278,6 @@ where
 
 #[cfg(test)]
 async fn test_fut() -> Result<(), failure::Error> {
-    use futures::FutureExt;
     use futures::TryFutureExt;
 
     let pool = Pool::new(20, || {
